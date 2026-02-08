@@ -1,0 +1,311 @@
+This is a complete, runnable production-grade skeleton for your Temporal + Python trading bot.
+It uses free tools only:
+ * Market Data: yfinance (Simulates live feed by fetching recent candles).
+ * Execution: A local Mock Broker (File-based JSON system) so you don't need a brokerage account yet.
+ * Orchestration: temporalio (The core engine).
+ * LLM: OpenRouter (via standard OpenAI library).
+📂 1. Project Structure
+Create a folder named trade_bot and set it up like this:
+trade_bot/
+├── .env                  # Store OPENROUTER_API_KEY here
+├── config.py             # Settings (tickers, risk limits)
+├── mock_broker.json      # (Auto-generated) Persists your paper trades
+├── requirements.txt      # Python dependencies
+├── activities.py         # The actual tasks (Fetch data, Calculate Signal, Execute)
+├── workflows.py          # The Temporal orchestration logic
+├── worker.py             # The process that runs the tasks
+└── starter.py            # The script to kick off the bot
+
+🛠️ 2. Setup Dependencies
+Create requirements.txt:
+temporalio
+yfinance
+pandas
+openai
+python-dotenv
+
+Install them:
+pip install -r requirements.txt
+
+Create .env:
+OPENROUTER_API_KEY=sk-or-v1-your-key-here
+
+🐍 3. The Code
+A. Configuration (config.py)
+Central place for your trading rules.
+# config.py
+TRADING_PAIR = "RELIANCE.NS"  # Indian stock symbol on Yahoo Finance
+INTERVAL = "1m"               # 1 minute candles for testing
+QTY = 10                      # Quantity to trade
+PAPER_BALANCE = 100000        # Starting Rupees
+
+# OpenRouter / LLM Settings
+LLM_MODEL = "mistralai/mistral-7b-instruct:free" # Use free models on OpenRouter for testing
+
+B. The "Mock" Broker & Market Data (activities.py)
+This file contains the Activities — the actual work the bot does.
+import asyncio
+import json
+import os
+import yfinance as yf
+import pandas as pd
+from datetime import datetime
+from temporalio import activity
+from openai import OpenAI
+from dotenv import load_dotenv
+import config
+
+load_dotenv()
+
+# --- HELPER: MOCK BROKER (Local JSON) ---
+BROKER_FILE = "mock_broker.json"
+
+def _get_broker_state():
+    if not os.path.exists(BROKER_FILE):
+        return {"balance": config.PAPER_BALANCE, "positions": {}, "history": []}
+    with open(BROKER_FILE, "r") as f:
+        return json.load(f)
+
+def _save_broker_state(state):
+    with open(BROKER_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+# --- ACTIVITIES ---
+
+@activity.defn
+async def fetch_market_data(ticker: str) -> dict:
+    """Fetches the latest candle from Yahoo Finance."""
+    try:
+        # yfinance fetch. period='1d', interval='1m' gets recent minute data
+        df = yf.download(ticker, period="1d", interval=config.INTERVAL, progress=False)
+        if df.empty:
+            raise ValueError("No data received")
+        
+        # Get last closed candle (second to last row to ensure it's closed)
+        last_candle = df.iloc[-1]
+        
+        return {
+            "symbol": ticker,
+            "price": float(last_candle["Close"]),
+            "time": str(last_candle.name),
+            "volume": int(last_candle["Volume"])
+        }
+    except Exception as e:
+        activity.logger.error(f"Data fetch failed: {e}")
+        raise e
+
+@activity.defn
+async def analyze_strategy(market_data: dict) -> str:
+    """
+    DETERMINISTIC STRATEGY:
+    Simple logic: If price ends in an odd number -> BUY, Even -> SELL.
+    (Replace this with your real Moving Average logic later).
+    """
+    price = market_data["price"]
+    
+    # Simple dummy logic for testing the pipeline
+    if int(price) % 2 != 0:
+        return "BUY"
+    else:
+        return "SELL"
+
+@activity.defn
+async def execute_paper_order(signal: str, price: float) -> str:
+    """Executes order in the local JSON file."""
+    if signal == "HOLD":
+        return "No Trade Executed"
+
+    state = _get_broker_state()
+    ticker = config.TRADING_PAIR
+    qty = config.QTY
+    cost = price * qty
+
+    if signal == "BUY":
+        if state["balance"] >= cost:
+            state["balance"] -= cost
+            current_qty = state["positions"].get(ticker, 0)
+            state["positions"][ticker] = current_qty + qty
+            log = f"BUY {qty} @ {price}"
+        else:
+            return "Insufficient Funds"
+            
+    elif signal == "SELL":
+        current_qty = state["positions"].get(ticker, 0)
+        if current_qty >= qty:
+            state["balance"] += cost
+            state["positions"][ticker] = current_qty - qty
+            log = f"SELL {qty} @ {price}"
+        else:
+            return "Insufficient Position"
+
+    # Log trade
+    state["history"].append({"action": signal, "price": price, "time": str(datetime.now())})
+    _save_broker_state(state)
+    return f"SUCCESS: {log}. New Balance: {state['balance']}"
+
+@activity.defn
+async def llm_audit(trade_result: str, market_data: dict) -> str:
+    """Uses OpenRouter to comment on the trade execution."""
+    if "SUCCESS" not in trade_result:
+        return "Skipped LLM: No trade made."
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
+
+    prompt = (
+        f"You are a trading risk manager. A trade was just executed:\n"
+        f"Symbol: {market_data['symbol']}\n"
+        f"Price: {market_data['price']}\n"
+        f"Result: {trade_result}\n\n"
+        "Briefly analyze if this execution seems safe or risky based on the price."
+    )
+
+    completion = client.chat.completions.create(
+        model=config.LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    return completion.choices[0].message.content
+
+C. The Workflow Engine (workflows.py)
+This is the "Brain". It defines the loop. Even if your script crashes, Temporal remembers where it was in this loop.
+from datetime import timedelta
+from temporalio import workflow
+
+# Import activity definitions
+with workflow.unsafe.imports_passed_through():
+    from activities import fetch_market_data, analyze_strategy, execute_paper_order, llm_audit
+    import config
+
+@workflow.defn
+class TradingBotWorkflow:
+    @workflow.run
+    async def run(self, ticker: str):
+        # Run primarily for a set number of iterations (or infinite loop)
+        for i in range(5):  # Runs 5 times then stops (for safety in testing)
+            
+            workflow.logger.info(f"--- Cycle {i+1} Start ---")
+
+            # 1. Fetch Data (Retry up to 3 times if API fails)
+            data = await workflow.execute_activity(
+                fetch_market_data,
+                ticker,
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=workflow.RetryPolicy(maximum_attempts=3)
+            )
+
+            # 2. Strategy Calculation
+            signal = await workflow.execute_activity(
+                analyze_strategy,
+                data,
+                start_to_close_timeout=timedelta(seconds=5)
+            )
+
+            # 3. Execution (Critical Step)
+            trade_result = await workflow.execute_activity(
+                execute_paper_order,
+                args=[signal, data["price"]],
+                start_to_close_timeout=timedelta(seconds=5)
+            )
+
+            # 4. LLM Analysis (Non-blocking / Optional logic could go here)
+            if "SUCCESS" in trade_result:
+                analysis = await workflow.execute_activity(
+                    llm_audit,
+                    args=[trade_result, data],
+                    start_to_close_timeout=timedelta(seconds=30)
+                )
+                workflow.logger.info(f"LLM Audit: {analysis}")
+
+            workflow.logger.info(f"Cycle finished. Sleeping for {config.INTERVAL}...")
+            
+            # 5. Sleep until next candle
+            # In production, use sleep(60) or cron schedule
+            await workflow.sleep(timedelta(seconds=60)) 
+
+        return "Trading Session Complete"
+
+D. The Worker (worker.py)
+This listens for tasks from the Temporal server.
+import asyncio
+from temporalio.client import Client
+from temporalio.worker import Worker
+
+from activities import fetch_market_data, analyze_strategy, execute_paper_order, llm_audit
+from workflows import TradingBotWorkflow
+
+async def main():
+    # Connect to local Temporal server
+    client = await Client.connect("localhost:7233")
+
+    # Run the worker
+    worker = Worker(
+        client,
+        task_queue="trading-bot-queue",
+        workflows=[TradingBotWorkflow],
+        activities=[fetch_market_data, analyze_strategy, execute_paper_order, llm_audit],
+    )
+
+    print("Worker started... listening for trade tasks.")
+    await worker.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+E. The Trigger (starter.py)
+Run this once to tell Temporal "Start the bot".
+import asyncio
+from temporalio.client import Client
+import config
+from workflows import TradingBotWorkflow
+
+async def main():
+    client = await Client.connect("localhost:7233")
+
+    handle = await client.start_workflow(
+        TradingBotWorkflow.run,
+        config.TRADING_PAIR,
+        id="indian-market-bot-01",
+        task_queue="trading-bot-queue",
+    )
+
+    print(f"Workflow started. ID: {handle.id}")
+    print(f"View execution at http://localhost:8233")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+🚀 4. How to Run It
+Step 1: Start Temporal Server (Locally)
+You need the Temporal server running. The easiest way is using the CLI.
+ * Mac/Linux: brew install temporal then temporal server start-dev
+ * Windows: Download the binary from Temporal website or run via Docker.
+Once running, go to http://localhost:8233 in your browser. You should see the UI.
+Step 2: Start your Worker
+Open a terminal in your project folder:
+python worker.py
+
+It will say "Worker started..." and wait.
+Step 3: Trigger the Workflow
+Open a second terminal:
+python starter.py
+
+📉 What will happen?
+ * Starter sends a command to Temporal.
+ * Temporal queues the run task.
+ * Worker picks it up:
+   * Fetches RELIANCE.NS data.
+   * Checks the "Odd/Even" strategy.
+   * Executes a paper trade in mock_broker.json.
+   * Sends the result to OpenRouter (Mistral/LLM).
+   * Sleeps for 60 seconds.
+ * You can watch the Green progress bars move in real-time on the localhost UI (http://localhost:8233).
+🧪 Why this is better than a simple loop?
+Try killing the python worker.py terminal in the middle of the "Sleep" or "Execution".
+Then restart it (python worker.py).
+Magic: It will pick up exactly where it left off. It won't double-buy, and it won't forget the trade history. That is why you use Temporal.
+Would you like me to guide you on how to change the dummy "Odd/Even" strategy to a real RSI or Moving Average Crossover using the ta-lib or pandas?
+... Get Started with Temporal ...
+This video is an excellent visual introduction to how Temporal workflows function, reinforcing the concepts of durable execution and reliability that are critical for your trading bot.
